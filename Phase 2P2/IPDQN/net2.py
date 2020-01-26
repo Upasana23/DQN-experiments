@@ -1,0 +1,243 @@
+# Tranfer Learning network
+import numpy as np
+import tensorflow as tf
+
+
+# Tranfer Learning network
+
+def PReLU(x, alpha_name, name, init=0.001):
+    with tf.variable_scope(name):
+        _init = tf.constant_initializer(init)
+        alpha = tf.get_variable(alpha_name, [], initializer=_init)
+        x = tf.multiply(((1 + alpha)*x + (1 - alpha)*tf.abs(x)), 0.5)
+    return x
+
+class Net:
+    def __init__(self, n_state, n_action, config):
+        self.C = config
+        self.n_state = n_state + [self.C['frame_stack']]
+        self.n_action = n_action
+        self.n_delta_s = np.prod([n_action] + self.n_state)
+        self.n_delta_s_a = np.prod(self.n_state)
+        self._make()
+        
+        
+    def _make_ph(self):
+        self.s_ph = tf.placeholder(tf.uint8, [None]+self.n_state) #state(frame stack)
+        self.a_ph = tf.placeholder(tf.int32, [None]) #action
+        self.r_ph = tf.placeholder(tf.float32, [None]) #reward
+        self.d_ph = tf.placeholder(tf.float32, [None]) #destination (boolean)
+        self.ns_ph = tf.placeholder(tf.uint8, [None] + self.n_state) #next state
+        self.lr_ph = tf.placeholder(tf.float32, []) #learning rate
+        
+    def _build_net_pt(self, inp, scope_name1, scope_name2):
+        inp = tf.cast(inp, tf.float32)/255.0
+        with tf.variable_scope(scope_name1, reuse=tf.AUTO_REUSE):
+            l = tf.layers.conv2d(inputs=inp, filters=self.C['filter1'], kernel_size=self.C['size1'], strides=self.C['strides1'], padding ="same", kernel_initializer= tf.contrib.layers.variance_scaling_initializer(2.0))
+            l = PReLU(l, 'alpha', 'PReLU')
+            l = tf.layers.conv2d(inputs=l, filters=self.C['filter2'], kernel_size=self.C['size2'], strides=self.C['strides2'], padding ="same",  kernel_initializer= tf.contrib.layers.variance_scaling_initializer(2.0))
+            l = PReLU(l, 'alpha_1', 'PReLU_1')
+            l = tf.layers.conv2d(inputs=l, filters=self.C['filter3'], kernel_size=self.C['size3'], strides=self.C['strides3'], padding ="same", kernel_initializer= tf.contrib.layers.variance_scaling_initializer(2.0))
+            l2 = PReLU(l, 'alpha_2', 'PReLU_2')
+        with tf.variable_scope(scope_name2, reuse=tf.AUTO_REUSE):
+            l1 = tf.layers.dense(tf.layers.flatten(l2), units=self.C['units1'])
+            #l = tf.layers.dense(l1, units=self.C['units2'])    
+            #l = tf.layers.dense(l, units=self.C['units3'])
+            #l = tf.layers.dense(l, units=self.C['units4'])  
+            l = tf.nn.leaky_relu(l1, alpha=0.01)
+            delta_s = tf.layers.dense(l, self.n_delta_s)
+            # return Q
+            return delta_s, l1, l2
+          
+          
+    def _build_net(self, inp, scope_name1, scope_name2):
+        inp = tf.cast(inp, tf.float32)/255.0
+        with tf.variable_scope(scope_name1, reuse=tf.AUTO_REUSE):
+            l = tf.layers.conv2d(inputs=inp, filters=self.C['filter1'], kernel_size=self.C['size1'], strides=self.C['strides1'], padding ="same", kernel_initializer= tf.contrib.layers.variance_scaling_initializer(2.0))
+            l = PReLU(l, 'alpha', 'PReLU')
+            l = tf.layers.conv2d(inputs=l, filters=self.C['filter2'], kernel_size=self.C['size2'], strides=self.C['strides2'], padding ="same",  kernel_initializer= tf.contrib.layers.variance_scaling_initializer(2.0))
+            l = PReLU(l, 'alpha_1', 'PReLU_1')    
+            l = tf.layers.conv2d(inputs=l, filters=self.C['filter3'], kernel_size=self.C['size3'], strides=self.C['strides3'], padding ="same", kernel_initializer= tf.contrib.layers.variance_scaling_initializer(2.0))
+            l4 = PReLU(l, 'alpha_2', 'PReLU_2')
+        with tf.variable_scope(scope_name2, reuse=tf.AUTO_REUSE):
+            l3 = tf.layers.dense(tf.layers.flatten(l4), units=self.C['units1'])
+            #l = tf.layers.dense(l3, units=self.C['units2'])
+            #l = tf.layers.dense(l, units=self.C['units3'])
+            #l = tf.layers.dense(l, units=self.C['units4'])
+            l = tf.nn.leaky_relu(l3, alpha=0.01)
+            Q = tf.layers.dense(l, self.n_action)
+            return Q, l3, l4
+
+            
+    def _build_graph(self):
+        s = tf.transpose(tf.reshape(self.delta_s, [-1, self.n_action, self.n_delta_s_a]), [2, 0, 1])
+        s_reduced = tf.reduce_sum(s * tf.one_hot(self.a_ph, self.n_action),2)
+        pred_s = tf.reshape(tf.transpose(s_reduced), [-1]+self.n_state)
+        pred = tf.reduce_sum(self.s_Q * tf.one_hot(self.a_ph, self.n_action), 1)
+        best_v = tf.reduce_max(self.target_Q, 1)
+        
+        with tf.variable_scope('loss'):
+            target = tf.clip_by_value(self.r_ph, -1, 1) + (1.-self.d_ph)*self.C['discount_factor']*tf.stop_gradient(best_v)
+            target_s = self.ns_ph - self.s_ph
+            loss = tf.losses.huber_loss(target, pred, reduction = tf.losses.Reduction.MEAN)
+            loss_s = tf.losses.mean_squared_error(target_s, pred_s)
+            
+        return loss, loss_s
+    
+    """def _build_train(self):
+        optimizer_pre = tf.train.AdamOptimizer(self.lr_ph)
+        optimizer = tf.train.AdamOptimizer(self.lr_ph)
+        
+        if self.C['grad_clip'] is None:
+            self.optimize_op = optimizer.minimize(self.loss)
+        else:
+            grads = optimizer.compute_gradients(self.loss, var_list=self.s_Q_global_params1+self.s_Q_global_params2) # possible error
+            for i, (grad, var) in enumerate(grads):
+                if grad is not None:
+                    grads[i] = (tf.clip_by_norm(grad, self.C['grad_clip']), var)
+            self.optimize_op = optimizer.apply_gradients(grads)
+            
+        self.optimize_init = optimizer_pre.minimize(self.loss_s)
+        self.optimize_init2 = optimizer_pre.minimize(self.loss_s, var_list = self.init_global_params2)
+        
+        ops_init = []
+        for o,t in zip(self.init_global_params1, self.s_Q_global_params1):
+            ops_init.append(t.assign(o))
+        
+        self.init_online_op = tf.group(*ops_init)
+        
+        ops_init2 = []
+        for o,t in zip([self.init_global_params2[0]], [self.s_Q_global_params2[0]]):
+            ops_init2.append(t.assign(o))
+        
+        self.init_online_op2 = tf.group(*ops_init2) 
+        
+        ops = []
+        for o,t in zip(self.s_Q_global_params1, self.target_Q_global_params1):
+            ops.append(t.assign(o))
+            
+        for o,t in zip(self.s_Q_global_params2, self.target_Q_global_params2):
+            ops.append(t.assign(o))
+            
+        self.update_target_op = tf.group(*ops) #operation for updating target network
+        
+        ops_prac= []
+        for o,t in zip(self.s_Q_global_params1, self.init_global_params2):
+            ops_prac.append(t.assign(o))
+			
+        self.update_practice = tf.group(*ops_prac)"""
+
+
+    def _build_train(self):
+        optimizer_pre = tf.train.AdamOptimizer(self.lr_ph)
+        optimizer = tf.train.AdamOptimizer(self.lr_ph)
+        
+        if self.C['grad_clip'] is None:
+            self.optimize_op = optimizer.minimize(self.loss)
+        else:
+            grads = optimizer.compute_gradients(self.loss, var_list=self.s_Q_global_params1+self.s_Q_global_params2) # possible error
+            for i, (grad, var) in enumerate(grads):
+                if grad is not None:
+                    grads[i] = (tf.clip_by_norm(grad, self.C['grad_clip']), var)
+            self.optimize_op = optimizer.apply_gradients(grads)
+
+        if self.C['grad_clip'] is None:
+            self.optimize_init = optimizer_pre.minimize(self.loss_s)
+        else:
+            grads = optimizer.compute_gradients(self.loss_s, var_list=self.init_global_params1+self.init_global_params2) # possible error
+            for i, (grad, var) in enumerate(grads):
+                if grad is not None:
+                    grads[i] = (tf.clip_by_norm(grad, self.C['grad_clip']), var)
+            self.optimize_init = optimizer_pre.apply_gradients(grads)
+
+        #self.optimize_init = optimizer_pre.minimize(self.loss_s)
+        self.optimize_init2 = optimizer_pre.minimize(self.loss_s, var_list = self.init_global_params2)
+        
+        ops_init = []
+        for o,t in zip(self.init_global_params1, self.s_Q_global_params1):
+            ops_init.append(t.assign(o))
+        
+        self.init_online_op = tf.group(*ops_init)
+        
+        ops_init2 = []
+        for o,t in zip([self.init_global_params2[0]], [self.s_Q_global_params2[0]]):
+            ops_init2.append(t.assign((0.5*o)+(0.5*t)))
+
+        for o,t in zip([self.init_global_params2[1]], [self.s_Q_global_params2[1]]):
+            ops_init2.append(t.assign((0.5*o)+(0.5*t)))
+        
+        self.init_online_op2 = tf.group(*ops_init2)     
+        
+        ops = []
+        for o,t in zip(self.s_Q_global_params1, self.target_Q_global_params1):
+            ops.append(t.assign(o))
+            
+        for o,t in zip(self.s_Q_global_params2, self.target_Q_global_params2):
+            ops.append(t.assign(o))
+            
+        self.update_target_op = tf.group(*ops) #operation for updating target network
+        
+        ops_prac= []
+        for o,t in zip([self.s_Q_global_params2[0]], [self.init_global_params2[0]]):
+            ops_prac.append(t.assign(o))
+        
+        for o,t in zip([self.s_Q_global_params2[1]], [self.init_global_params2[1]]):
+            ops_prac.append(t.assign(o))
+			
+        """for o,t in zip(self.s_Q_global_params1, self.init_global_params1):
+            ops_prac.append(t.assign(o))"""
+
+        self.update_practice = tf.group(*ops_prac)
+        
+        
+    def _make(self):
+        self._make_ph()
+        self.delta_s, self.output1, self.output2 = self._build_net_pt(self.s_ph, 'pre-cnn', 'pre-dense')
+        self.s_Q, self.output3, self.output4 = self._build_net(self.s_ph, 'online-cnn', 'online-dense')
+        self.target_Q, self.o3, self.o4 = self._build_net(self.ns_ph, 'target-cnn', 'target-dense')
+        
+        self.init_global_params1 = [p for p in tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='pre-cnn')]
+        self.init_global_params2 = [p for p in tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='pre-dense')] 
+        self.s_Q_global_params1 = [p for p in tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='online-cnn')]
+        self.s_Q_global_params2 = [p for p in tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='online-dense')]
+        self.target_Q_global_params1 = [p for p in tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='target-cnn')]
+        self.target_Q_global_params2 = [p for p in tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='target-dense')]
+        self.loss, self.loss_s = self._build_graph()
+        self._build_train()
+        
+    def initialize_online_network(self):
+        tf.get_default_session().run(self.init_online_op)
+
+    def update_target_network(self):
+        tf.get_default_session().run(self.update_target_op)
+        
+    def update_practice_network(self):
+        tf.get_default_session().run(self.update_practice)
+        
+    def update_online_network(self):
+        tf.get_default_session().run(self.init_online_op2)
+        
+    def action(self, s):
+        return np.argmax(tf.get_default_session().run(self.s_Q, feed_dict={self.s_ph:[s]})[0])
+      
+    def pre_train(self, buffer, learning_rate):
+        sb, ab, nsb = buffer.samplePT(self.C['batch_size'])
+        tf.get_default_session().run(self.optimize_init , feed_dict ={self.s_ph: sb, self.a_ph: ab, self.ns_ph: nsb, self.lr_ph: learning_rate}) 
+        
+    def pre_train2(self, buffer, learning_rate):
+        sb, ab, nsb = buffer.samplePT(self.C['batch_size'])
+        tf.get_default_session().run(self.optimize_init2 , feed_dict ={self.s_ph: sb, self.a_ph: ab, self.ns_ph: nsb, self.lr_ph: learning_rate}) 
+        
+    def train(self, buffer, learning_rate):
+        sb, ab, rb, db, nsb = buffer.sample(self.C['batch_size'])
+        tf.get_default_session().run(self.optimize_op, feed_dict ={self.s_ph: sb, self.a_ph: ab, self.r_ph: rb, self.d_ph:db, self.ns_ph: nsb, self.lr_ph: learning_rate})
+        # return Q
+        
+      
+    def save(self, directory):
+        saver = tf.train.Saver()
+        saver.save(tf.get_default_session(), directory+'/model.ckpt')
+        
+    def load(self, directory):
+        saver = tf.train.Saver()
+        saver.restore(tf.get_default_session(), directory+'/model.ckpt')
